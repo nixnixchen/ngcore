@@ -8,12 +8,18 @@ INCLUDES = -I include
 LDFLAGS = -static -L$(LIBDIR) -lLIEF
 CFLAGS :=  -O2 -Wall -fPIC -g $(INCLUDES) $(LDFLAGS)
 
+SRCS = src/ngcore.c src/elf_parser.c
+OBJS = $(SRCS:.c=.o)
+
 all:  ngcore
 
-ngcore: src/ngcore.c
-	$(CC)  $< -o $(BIN_DIR)/$@ $(CFLAGS)
+ngcore:$(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) -o $(BIN_DIR)/$@ 
 
-elf_test: src/modify_elf.c
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+elf_parser: src/elf_parser.c
 	$(CC)  $< -o $(BIN_DIR)/$@ $(CFLAGS)
 
 clean:

@@ -1,8 +1,3 @@
-/*
-TODO1: multithreads thread info
-TODO2: kill zombie process
- */
-
 #define _GNU_SOURCE 
 #include <assert.h>
 #include <ctype.h>
@@ -15,6 +10,7 @@ TODO2: kill zombie process
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 #include <sys/ptrace.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -24,13 +20,18 @@ TODO2: kill zombie process
 #include <sched.h>
 #include <signal.h>
 #include <dirent.h>
+#include <syscall.h>
+#include <sys/resource.h>
+
+#include "elf_parser.h"
 
 #define MAXLINE 1024
 #define MAXPROCESS 1024
 
 
-// TODO kill zombie process
-
+int ptrace_setrlimit(pid_t pid, int resource);
+void read_rlimit(pid_t pid, unsigned long where, struct rlimit *rlim);
+void poke_rlimit(pid_t pid, unsigned long where, struct rlimit *rlim);
 
 int poke_text(pid_t pid, void *where, void *new_text, void *old_text, size_t len)
 {
@@ -111,6 +112,20 @@ void check_yama(void) {
 	fclose(yama_file);
 }
 
+int read_proc_cwd(pid_t pid, char* path_buff, size_t max_size)
+{
+	char proc_path[MAXLINE];
+	sprintf(proc_path, "/proc/%d/cwd", pid);
+
+	ssize_t len = readlink(proc_path, path_buff, max_size - 1);
+	if (len == -1){
+		return -1;
+	}
+	path_buff[len] = '\0';
+
+	return 0;
+}
+
 int dump_core(pid_t pid) {
 	// STEP0 get all threads
 	char proc_dir[MAXLINE];
@@ -133,18 +148,16 @@ int dump_core(pid_t pid) {
 		}
 		tids[t_cnt++] = atoi(pDirent ->d_name);
 	}
-	
+
 	// STEP1 attach all threads
 	for(int i = 0; i < t_cnt; i++){
 		if (ptrace(PTRACE_ATTACH, tids[i], NULL, NULL)) {
-			perror("PTRACE_ATTACH");
 			check_yama();
 			return -1;
 		}
 
 		// wait for the process to actually stop
 		if (waitpid(tids[i], 0, WSTOPPED) == -1) {
-			perror("wait");
 			return -1;
 		}
 	}
@@ -154,8 +167,6 @@ int dump_core(pid_t pid) {
 	struct user_regs_struct oldregs;
 
 	for(int i = 0; i < t_cnt; i++){
-		printf("attach %d start...\n", tids[i]);
-
 		if (ptrace(PTRACE_GETREGS, tids[i], NULL, &alloldregs[i])) {
 			perror("PTRACE_GETREGS");
 			ptrace(PTRACE_DETACH, tids[i], NULL, NULL);
@@ -165,8 +176,6 @@ int dump_core(pid_t pid) {
 		if(tids[i] == pid){
 			oldregs = alloldregs[i];
 		}
-
-		printf("process %d %%rip:           %p\n", tids[i], (void *)alloldregs[i].rip);
 	}
 
 	void *rip = (void *)oldregs.rip;
@@ -216,13 +225,13 @@ int dump_core(pid_t pid) {
 		return -1;
 	}
 
-	pid_t child_pid = newregs.rax;
-	printf("child pid : %d\n", child_pid);
+	pid_t puppet_pid = newregs.rax;
+	printf("forked pid : %d\n", puppet_pid);
 
 	// STEP2 restore and detach target process
 	poke_text(pid, rip, old_word, NULL, sizeof(old_word));
 
-	printf("restoring old registers\n");
+	printf("restoring registers\n");
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &oldregs)) {
 		perror("PTRACE_SETREGS");
 		goto fail;
@@ -235,30 +244,85 @@ int dump_core(pid_t pid) {
 	}
 
 	// STEP3 use kill -SIGSEGV to create a core file in child process
-	if (waitpid(child_pid, 0, WSTOPPED) == -1) {
+	if (waitpid(puppet_pid, 0, WSTOPPED) == -1) {
 		perror("wait");
 		return -1;
 	}
 
-	poke_text(child_pid, rip, old_word, NULL, sizeof(old_word));
-
-	printf("restoring old registers\n");
-	if (ptrace(PTRACE_SETREGS, child_pid, NULL, &oldregs)) {
+	// restore child process
+	poke_text(puppet_pid, rip, old_word, NULL, sizeof(old_word));
+	printf("restoring child old registers\n");
+	if (ptrace(PTRACE_SETREGS, puppet_pid, NULL, &oldregs)) {
 		perror("PTRACE_SETREGS");
 		goto fail;
 	}
 
-	kill(child_pid, SIGABRT);
+	// ptrace_setrlimit unlimied
+	if(ptrace_setrlimit(puppet_pid, RLIMIT_CORE)){
+		return -1;
+	}
+
+	poke_text(puppet_pid, rip, old_word, NULL, sizeof(old_word));
+	printf("restoring child old registers\n");
+	if (ptrace(PTRACE_SETREGS, puppet_pid, NULL, &oldregs)) {
+		perror("PTRACE_SETREGS");
+		goto fail;
+	}
+
+	printf("signal abort to process %d !\n", puppet_pid);
+	kill(puppet_pid, SIGABRT);
+
+	if(ptrace(PTRACE_DETACH, puppet_pid, NULL, NULL)) {
+		perror("PTRACE_DETACH CHILD");
+		goto fail;
+	}
 
 	//STEP4 modify core file
-	// TODO recover registers and last instruction in core file
-	// https://lief-project.github.io/doc/latest/tutorials/12_elf_coredump.html
+	char target_working_dir[MAXLINE];
+	char ngcore_working_dir[MAXLINE];
+
+	int read_result = read_proc_cwd(pid, target_working_dir, MAXLINE);
+	if(read_result < 0){
+		return -1;
+	}
+
+	char main_thread_core[MAXLINE];
+	char process_core[MAXLINE];
+	char pid_str[MAXLINE];
+	sprintf(pid_str, "%d", puppet_pid);
+
+	while(!main_thread_core[0]){
+		// FIXME timeout
+		pDir = opendir(target_working_dir);
+		if(!pDir){
+			return -1;
+		}
+
+		while((pDirent=readdir(pDir)) != NULL){
+			if(strstr(pDirent ->d_name, pid_str) != NULL){
+				snprintf(main_thread_core, MAXLINE, "%s/%s", target_working_dir, pDirent ->d_name);
+				printf("core file found: %s\n", main_thread_core);
+				break;
+			}
+		}
+
+		closedir(pDir);
+		sleep(1);
+	}
+
+	read_result = read_proc_cwd(getpid(), ngcore_working_dir, MAXLINE);
+	if(read_result < 0){
+		return -1;
+	}
+
+	snprintf(process_core, MAXLINE, "%s/core.%d", ngcore_working_dir, pid);
+	if(add_pr_note(main_thread_core, process_core, t_cnt, tids, alloldregs)){
+		printf("add pr_note failed\n");
+	}
 
 	return 0;
 
 fail:
-	// STEP0 recover from fail
-	printf("fail\n");
 	poke_text(pid, rip, old_word, NULL, sizeof(old_word));
 	if (ptrace(PTRACE_DETACH, pid, NULL, NULL)) {
 		perror("PTRACE_DETACH");
@@ -310,5 +374,131 @@ int main(int argc, char **argv)
 	}
 
 	dump_core((pid_t)pid);
+}
+
+int ptrace_setrlimit(pid_t pid, int resource)
+{
+	struct user_regs_struct orig;
+	if (ptrace(PTRACE_GETREGS, pid, 0, &orig)) {
+		perror("ptrace(PTRACE_GETREGS, ...)");
+		return 1;
+	}
+
+	errno = 0;
+	const long orig_word = ptrace(PTRACE_PEEKTEXT, pid, orig.rip, 0);
+	if (orig_word == -1 && errno) {
+		perror("ptrace(PTRACE_PEEKTEXT, ...)");
+		return 1;
+	}
+
+	if (ptrace(PTRACE_POKETEXT, pid, orig.rip, 0x050f)) {
+		perror("ptrace(PTRACE_POKETEXT, ...)");
+		return 1;
+	}
+
+	struct user_regs_struct new_regs;
+	memcpy(&new_regs, &orig, sizeof(new_regs));
+
+	new_regs.rax = SYS_getrlimit;                         // sys_getrlimit
+	new_regs.rdi = resource;                              // resource
+	new_regs.rsi = new_regs.rsp - sizeof(struct rlimit);  // rlim
+
+	if (ptrace(PTRACE_SETREGS, pid, 0, &new_regs)) {
+		perror("ptrace(PTRACE_SETREGS, ...)");
+		return 1;
+	}
+
+	if (singlestep(pid)) {
+		perror("ptrace(PTRACE_SINGLESTEP, ...)");
+		return 1;
+	}
+
+	if (ptrace(PTRACE_GETREGS, pid, 0, &new_regs)) {
+		perror("ptrace(PTRACE_GETREGS, ...)");
+		return 1;
+	}
+
+	if (new_regs.rip - 2 != orig.rip) {
+		//
+	}
+	if (new_regs.rax != 0) {
+		//
+	}
+
+	struct rlimit rlim;
+	read_rlimit(pid, new_regs.rsp - sizeof(struct rlimit), &rlim);
+
+	if (rlim.rlim_cur == rlim.rlim_max) {
+		//
+	} else {
+		rlim.rlim_cur = rlim.rlim_max;
+		poke_rlimit(pid, orig.rsp - sizeof(struct rlimit), &rlim);
+
+		memcpy(&new_regs, &orig, sizeof(new_regs));
+		new_regs.rax = SYS_setrlimit;                         // sys_setrlimit
+		new_regs.rdi = resource;                              // resource
+		new_regs.rsi = new_regs.rsp - sizeof(struct rlimit);  // rlim
+
+		if (ptrace(PTRACE_SETREGS, pid, 0, &new_regs)) {
+			perror("ptrace(PTRACE_SETREGS, ...)");
+			return 1;
+		}
+
+		if (singlestep(pid)) {
+			perror("ptrace(PTRACE_SINGLESTEP, ...)");
+			return 1;
+		}
+
+		if (ptrace(PTRACE_GETREGS, pid, 0, &new_regs)) {
+			perror("ptrace(PTRACE_GETREGS, ...)");
+			return 1;
+		}
+
+		if (new_regs.rip - 2 != orig.rip) {
+			//
+		}
+		if (new_regs.rax != 0) {
+			//
+		}
+	}
+
+	if (ptrace(PTRACE_POKETEXT, pid, orig.rip, orig_word)) {
+		perror("ptrace(PTRACE_POKETEXT...");
+		return 1;
+	}
+	if (ptrace(PTRACE_SETREGS, pid, 0, &orig)) {
+		perror("ptrace(PTRACE_SETREGS...");
+		return 1;
+	}
+
+	return 0;
+}
+
+void read_rlimit(pid_t pid, unsigned long where, struct rlimit *rlim)
+{
+	const size_t sz = sizeof(struct rlimit) / sizeof(long);
+	for (size_t i = 0; i < sz; i++) {
+		errno = 0;
+		long word = ptrace(PTRACE_PEEKTEXT, pid, where + i * sizeof(long), 0);
+
+		if (word == -1 && errno) {
+			perror("ptrace(PTRACE_PEEKTEXT, ...)");
+			exit(1);
+		}
+		memcpy((long *)(rlim) + i, &word, sizeof(word));
+	}
+}
+
+void poke_rlimit(pid_t pid, unsigned long where, struct rlimit *rlim)
+{
+	const size_t sz = sizeof(struct rlimit) / sizeof(long);
+	for (size_t i = 0; i < sz; i++) {
+		long word;
+		memcpy(&word, (long *)(rlim) + i, sizeof(word));
+
+		if (ptrace(PTRACE_POKETEXT, pid, where + i * sizeof(long), word)) {
+			perror("ptrace(PTRACE_POKETEXT...)");
+		}
+	}
 }
 
